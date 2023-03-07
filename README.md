@@ -1,3 +1,11 @@
+# Bomberman
+
+### Short project description in English
+
+This is a project for "Computer Networks".
+It contains a TCP client for a simple version of a popular game "bomberman".
+It also contains a TCP "bomberman" server, but the server is unfinished.
+
 # Bombowe roboty
 
 ### 0.1. GUI
@@ -30,7 +38,7 @@ Gra toczy się cyklicznie - po uzbieraniu się odpowiedniej liczby graczy rozpoc
 
 ### 1.2. Architektura rozwiązania
 
-Na grę składają się trzy komponenty: serwer, klient, serwer obsługujący interfejs użytkownika. Należy zaimplementować serwer i klienta. Aplikację implementującą serwer obsługujący graficzny interfejs użytkownika (ang. *GUI*) dostarczamy.
+Na grę składają się trzy komponenty: serwer, klient, serwer obsługujący interfejs użytkownika. Należy zaimplementować serwer i klienta. Aplikację implementującą serwer obsługujący graficzny interfejs użytkownika (ang. _GUI_) dostarczamy.
 
 Serwer komunikuje się z klientami, zarządza stanem gry, odbiera od klientów informacje o wykonywanych ruchach oraz rozsyła klientom zmiany stanu gry. Serwer pamięta wszystkie zdarzenia dla bieżącej partii i przesyła je w razie potrzeby klientom.
 
@@ -226,16 +234,16 @@ zdarzenia = []
 dla każdego gracza w kolejności id:
     pozycja_x_robota = random() % szerokość_planszy
     pozycja_y_robota = random() % wysokość_planszy
-    
+
     dodaj zdarzenie `PlayerMoved` do listy
-    
+
 tyle razy ile wynosi parametr `initial_blocks`:
     pozycja_x_bloku = random() % szerokość_planszy
     pozycja_y_bloku = random() % wysokość_planszy
-    
+
     jeśli nie ma bloku o pozycji (pozycja_x_bloku, pozycja_y_bloku) na liście:
         dodaj zdarzenie BlockPlaced do listy
-    
+
 wyślij komunikat `Turn`
 ```
 
@@ -260,8 +268,8 @@ dla każdej bomby:
         zaznacz, które bloki znikną w wyniku eksplozji
         zaznacz, które roboty zostaną zniszczone w wyniku eksplozji
         dodaj zdarzenie `BombExploded` do listy
-        usuń bombę    
-    
+        usuń bombę
+
 dla każdego gracza w kolejności id:
     jeśli robot nie został zniszczony:
         jeśli gracz wykonał ruch:
@@ -269,9 +277,9 @@ dla każdego gracza w kolejności id:
     jeśli robot został zniszczony:
         pozycja_x_robota = random() % szerokość_planszy
         pozycja_y_robota = random() % wysokość_planszy
-    
+
         dodaj zdarzenie `PlayerMoved` do listy
-        
+
 zwiększ nr_tury o 1
 ```
 
@@ -290,8 +298,6 @@ To serwer decyduje o tym, czy dany ruch jest dozwolony czy nie. Jeśli gracz sto
 ### 2.10. Kończenie rozgrywki
 
 Po `game_length` turach serwer wysyła do wszystkich klientów wiadomość `GameEnded` i wraca do stanu `Lobby`. Klienci, którzy byli do tej pory graczami, przestają nimi być, ale oczywiście mogą się z powrotem zgłosić przy pomocy komunikatu `Join`. Wszystkie komunikaty otrzymane w czasie ostatniej tury rozgrywki są ignorowane.
-
-
 
 ## 3. Protokół komunikacyjny pomiędzy klientem a interfejsem użytkownika
 
