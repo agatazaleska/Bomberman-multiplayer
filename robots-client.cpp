@@ -1,370 +1,112 @@
-#include <iostream>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 #include <thread>
 #include <boost/asio.hpp>
-#include "err.h"
 #include "options-parser.h"
+#include "definitions.h"
+#include "message-serializer.h"
+#include "game-handler.h"
 
-#define UDP_BUFFER_LENGTH   65507
+// Global variable defining current state.
+// In addition to Game and Lobby, I defined SendJoin state which
+// signals that we should send join message to the server.
+State current_state = SendJoin;
+// The variable is atomic - I ensure that using mutex.
+std::mutex curr_state_mutex;
 
-struct Player;
-struct Bomb;
-struct Position;
-
-using Score = uint32_t;
-using PlayerId = uint8_t;
-
-using scores_map_t = std::map<PlayerId , Score>;
-using players_map_t = std::map<PlayerId , Player>;
-using player_positions_map_t = std::map<PlayerId , Position>;
-using player_id_list_t = std::vector<PlayerId>;
-using position_list_t = std::vector<Position>;
-using bomb_list_t = std::vector<Bomb>;
-
-enum Direction {
-    Up, Right, Down, Left
-};
-
-enum ClientMessage {
-    Join, ClientPlaceBomb, ClientPlaceBlock, ClientMove
-};
-
-enum ServerMessage {
-    Hello, AcceptedPlayer, GameStarted, Turn, GameEnded, Unknown
-};
-
-enum State {
-    Lobby, Game
-};
-
-enum InputMessage {
-    InputPlaceBomb, InputPlaceBlock, InputMove
-};
-
-enum GuiMessage {
-    PlaceBomb, PlaceBlock, Move
-};
-
-struct Position {
-    uint16_t x;
-    uint16_t y;
-
-    Position(uint16_t x, uint16_t y): x(x), y(y){};
-};
-
-struct Bomb {
-    Position position;
-    uint16_t timer;
-
-    Bomb(Position position, uint16_t timer):
-        position(position), timer(timer){};
-};
-
-struct Player { //player id = uint8
-    std::string name;
-    std::string address;
-
-    Player(std::string name, std::string address):
-        name(std::move(name)), address(std::move(address)){};
-};
-
-struct Event {
-    uint8_t event_id;
-    Position position;
-    PlayerId player_id;
-    uint32_t bomb_id;
-    player_id_list_t players_list;
-    position_list_t bombs_exploded;
-
-    Event(uint8_t event_d, Position position, PlayerId player_id,
-          uint32_t bomb_id, player_id_list_t players_list, position_list_t bombs_exploaded):
-          event_id(event_d), position(position), player_id(player_id),
-          bomb_id(bomb_id), players_list(std::move(players_list)),
-          bombs_exploded(std::move(bombs_exploaded)){};
-};
-
-struct GameParameters {
-    std::string server_name;
-    uint8_t players_count;
-    uint16_t size_x;
-    uint16_t size_y;
-    uint16_t game_length;
-    uint16_t explosion_radius;
-    uint16_t bomb_timer;
-
-    GameParameters(std::string name, uint8_t players_n, uint16_t x, uint16_t y,
-                   uint16_t length, uint16_t radius, uint16_t timer):
-                   server_name(std::move(name)), players_count(players_n), size_x(x), size_y(y),
-                   game_length(length), explosion_radius(radius), bomb_timer(timer){};
-
-    GameParameters() = default;
-};
-
-struct GameState {
-    uint16_t turn;
-    player_positions_map_t player_positions;
-    players_map_t players;
-    position_list_t blocks;
-    bomb_list_t bombs;
-    position_list_t explosions;
-    scores_map_t scores;
-
-    GameState(players_map_t &players_map) {
-        turn = 0;
-        players = players_map;
-        blocks = {};
-        bombs = {};
-        explosions = {};
-        scores = {};
-        player_positions = {};
-
-        for (auto &player: players_map) {
-            scores.insert(std::make_pair(player.first, 0));
-            player_positions.insert(std::make_pair(player.first, Position(0,0)));
-        }
-    }
-    GameState() = default;
-};
-
-using namespace std;
-using namespace boost::asio;
-using namespace boost::asio::ip;
-
-State current_situation = Lobby;
-std::mutex curr_situation_mutex;
-
-void aggregate_game_state(GameState &state, vector<Event> &events) {
-
+// Helper functions for getting and setting current_state.
+static State get_state() {
+    curr_state_mutex.lock();
+    State s = current_state;
+    curr_state_mutex.unlock();
+    return s;
 }
 
-// robocza funkcja
-void set_game_parameters(GameParameters &parameters, players_map_t &players_map) {
-    parameters.server_name = "przykladowy serwer";
-    parameters.players_count = 3;
-    parameters.size_x = 10;
-    parameters.size_y = 10;
-    parameters.game_length = 1000;
-    parameters.explosion_radius = 4;
-    parameters.bomb_timer = 5;
-
-    players_map_t players;
-    players.insert(make_pair(1, Player("agata", "127.0.0.1:3333")));
-    players.insert(make_pair(2, Player("mikolaj", "127.0.0.1:2222")));
-    players.insert(make_pair(3, Player("zosia", "127.0.0.1:1111")));
-
-    players_map = players;
+static void set_state(State state) {
+    curr_state_mutex.lock();
+    current_state = state;
+    curr_state_mutex.unlock();
 }
 
-void put_data_into_buffer(char *&dest_ptr, void *src, size_t size) {
-    memcpy(dest_ptr, src, size);
-    dest_ptr += size;
-}
+// This function sends join request with a given player name to the server.
+void send_join_request(ConnectionsData &connections) {
+    std::string name = connections.player_name;
 
-void put_uint_32_into_buffer(char *&dest_ptr, uint32_t number) {
-    uint32_t number_to_send = htonl(number);
-    put_data_into_buffer(dest_ptr, &number_to_send, sizeof(uint32_t));
-}
-
-void put_uint_16_into_buffer(char *&dest_ptr, uint16_t number) {
-    uint16_t number_to_send = htons(number);
-    put_data_into_buffer(dest_ptr, &number_to_send, sizeof(uint16_t));
-}
-
-size_t serialize_object_size(char *&dest_ptr, uint32_t size) {
-    put_uint_32_into_buffer(dest_ptr, size);
-    return sizeof(uint32_t);
-}
-
-size_t serialize_players_map(char *&dest_ptr, players_map_t &map) {
-    size_t total_size = serialize_object_size(dest_ptr, map.size());
-
-    for (auto &player: map) {
-        uint8_t player_id = player.first;
-        std::string player_name = player.second.name;
-        std::string player_address = player.second.address;
-        uint8_t player_name_len = player_name.length();
-        uint8_t player_address_len = player_address.length();
-
-        put_data_into_buffer(dest_ptr, &player_id, 1);
-        put_data_into_buffer(dest_ptr, &player_name_len, 1);
-        put_data_into_buffer(dest_ptr, (void *) player_name.c_str(), player_name_len);
-        put_data_into_buffer(dest_ptr, &player_address_len, 1);
-        put_data_into_buffer(dest_ptr, (void *) player_address.c_str(), player_address_len);
-
-        total_size += (3 * sizeof(uint8_t) + player_name_len + player_address_len);
-    }
-    return total_size;
-}
-
-size_t serialize_position(char *&dest_ptr, Position position) {
-    put_uint_16_into_buffer(dest_ptr, position.x);
-    put_uint_16_into_buffer(dest_ptr, position.y);
-    return 2 * sizeof(uint16_t);
-}
-
-size_t serialize_bomb(char *&dest_ptr, Bomb bomb) {
-    serialize_position(dest_ptr, bomb.position);
-    put_uint_16_into_buffer(dest_ptr, bomb.timer);
-    return 3 * sizeof(uint16_t);
-}
-
-size_t serialize_player_positions_map(char *&dest_ptr, player_positions_map_t &map) {
-    size_t total_size = serialize_object_size(dest_ptr, map.size());
-
-    for (auto player_and_pos: map) {
-        uint8_t player_id = player_and_pos.first;
-        put_data_into_buffer(dest_ptr, &player_id, 1);
-        serialize_position(dest_ptr, player_and_pos.second);
-
-        total_size += (sizeof(uint8_t) + 2 * sizeof(uint16_t));
-    }
-    return total_size;
-}
-
-size_t serialize_scores_map(char *&dest_ptr, scores_map_t &map) {
-    size_t total_size = serialize_object_size(dest_ptr, map.size());
-
-    for (auto player_and_score: map) {
-        uint8_t player_id = player_and_score.first;
-        uint32_t score = player_and_score.second;
-
-        put_data_into_buffer(dest_ptr, &player_id, 1);
-        put_uint_32_into_buffer(dest_ptr, score);
-
-        total_size += (sizeof(uint8_t) + sizeof(uint32_t));
-    }
-    return total_size;
-}
-
-size_t serialize_position_list(char *&dest_ptr, position_list_t &positions) {
-    size_t total_size = serialize_object_size(dest_ptr, positions.size());
-
-    for(auto pos: positions)
-        total_size += serialize_position(dest_ptr, pos);
-
-    return total_size;
-}
-
-size_t serialize_bomb_list(char *&dest_ptr, bomb_list_t &bombs) {
-    size_t total_size = serialize_object_size(dest_ptr, bombs.size());
-
-    for (auto bomb: bombs)
-        total_size += serialize_bomb(dest_ptr, bomb);
-
-    return total_size;
-}
-
-size_t prepare_lobby_message(GameParameters &parameters, char buffer[], players_map_t players) {
-    State msg_type = Lobby;
-    char *dest_ptr = buffer;
-    put_data_into_buffer(dest_ptr, &msg_type, 1);
-
-    uint8_t name_length = parameters.server_name.length();
-    put_data_into_buffer(dest_ptr, &name_length, 1);
-    put_data_into_buffer(dest_ptr, (void *) parameters.server_name.c_str(), name_length);
-    put_data_into_buffer(dest_ptr, &parameters.players_count, 1);
-
-    put_uint_16_into_buffer(dest_ptr, parameters.size_x);
-    put_uint_16_into_buffer(dest_ptr, parameters.size_y);
-    put_uint_16_into_buffer(dest_ptr, parameters.game_length);
-    put_uint_16_into_buffer(dest_ptr, parameters.explosion_radius);
-    put_uint_16_into_buffer(dest_ptr, parameters.bomb_timer);
-
-    size_t total_size = (name_length + 5 * sizeof(uint16_t) + 3 * sizeof(uint8_t));
-    total_size += serialize_players_map(dest_ptr, players);
-    return total_size;
-}
-
-size_t prepare_game_message(GameParameters &parameters, GameState &state, char buffer[]) {
-    State msg_type = Game;
-    char *dest_ptr = buffer;
-    put_data_into_buffer(dest_ptr, &msg_type, 1);
-
-    uint8_t name_length = parameters.server_name.length();
-    put_data_into_buffer(dest_ptr, &name_length, 1);
-    put_data_into_buffer(dest_ptr, (void *) parameters.server_name.c_str(), name_length);
-
-    put_uint_16_into_buffer(dest_ptr, parameters.size_x);
-    put_uint_16_into_buffer(dest_ptr, parameters.size_y);
-    put_uint_16_into_buffer(dest_ptr, parameters.game_length);
-    put_uint_16_into_buffer(dest_ptr, state.turn);
-
-    size_t total_size = name_length + 2 * sizeof(uint8_t) + 4 * sizeof(uint16_t);
-
-    // czy to są ci sami playerzy co w lobby message???
-    total_size += serialize_players_map(dest_ptr, state.players);
-    total_size += serialize_player_positions_map(dest_ptr, state.player_positions);
-    total_size += serialize_position_list(dest_ptr, state.blocks);
-    total_size += serialize_bomb_list(dest_ptr, state.bombs);
-    total_size += serialize_position_list(dest_ptr, state.explosions);
-    total_size += serialize_scores_map(dest_ptr, state.scores);
-
-    return total_size;
-}
-
-/*
-void deserialize_server_message(char *message) {
-    char *msg_ptr = message;
-    auto message_type = static_cast<ServerMessage> (*((uint8_t*) message));
-
-    switch (message_type) {
-        case Hello:
-            break;
-        case AcceptedPlayer:
-            break;
-        case GameStarted:
-            break;
-        case Turn:
-            break;
-        case GameEnded:
-            break;
-    }
-}
-*/
-
-void send_join_request(std::string &player_name, tcp::socket &server_socket) {
-    size_t msg_len = 2 * sizeof(uint8_t) + player_name.length();
-    char join_msg[msg_len];
+    // Calculating message size and putting it (the message) into a buffer.
+    size_t message_size = 2 * sizeof(uint8_t) + name.length();
+    char join_msg[message_size];
     char *msg_ptr = join_msg;
     auto msg_type = (uint8_t) ClientMessage::Join;
-    uint8_t name_len = player_name.length();
+    uint8_t name_len = (uint8_t) name.length();
 
-    memcpy(msg_ptr, &msg_type, sizeof(uint8_t));
-    msg_ptr += 1;
+    put_data_into_buffer(msg_ptr, &msg_type, sizeof(uint8_t));
+    put_data_into_buffer(msg_ptr, &name_len, sizeof(uint8_t));
 
-    memcpy(msg_ptr, &name_len, sizeof(uint8_t));
-    msg_ptr += 1;
+    memcpy(msg_ptr, name.c_str(), name_len);
 
-    memcpy(msg_ptr, player_name.c_str(), name_len);
+    connections.server_socket.send(boost::asio::buffer(
+        std::string(join_msg, message_size)));
 
-    server_socket.send(boost::asio::buffer(std::string(join_msg)));
-    cout << "wyslano join\n";
+    if (debug) {
+        std::cerr << "sent " << message_size <<
+        " bytes to " << connections.server_endpoint << "\n";
+    }
 }
 
-void parse_message_from_gui() {
+// Helper function serializing lobby message and then sending it to gui.
+void send_lobby_to_gui(GameData &status, ConnectionsData &connections,
+                       char *buffer) {
 
+    size_t message_size = serialize_lobby_message(status.parameters, buffer,
+                                                  status.lobby_players);
+
+    connections.gui_socket.send_to(
+            boost::asio::buffer(buffer,message_size), connections.gui_endpoint);
+
+    if (debug) {
+        std::cerr << "sent " << message_size <<
+        " bytes to " << connections.gui_endpoint << "\n";
+    }
 }
 
+// Helper function serializing game message and then sending it to gui.
+void send_game_to_gui(GameData &status, ConnectionsData &connections,
+                      char *buffer) {
+
+    size_t message_size = serialize_game_message(
+            status.parameters,status.game_state, buffer);
+
+    connections.gui_socket.send_to(
+            boost::asio::buffer(buffer, message_size),connections.gui_endpoint);
+
+    if (debug) {
+        std::cerr << "sent " << message_size <<
+        " bytes to " << connections.gui_endpoint << "\n";
+    }
+}
+
+// This function checks gui message correctness:,
+// checks whether the first byte describes a valid message type
+// and then compares actual message length with expected message length.
 bool check_gui_message_correctness(char *gui_message, size_t len) {
     char *msg_ptr = gui_message;
-    auto message_type = static_cast<GuiMessage> (*((uint8_t*) msg_ptr));
-    Direction dir;
+    uint8_t message_type = (*((uint8_t*) msg_ptr));
+    if (message_type >= GUI_MESSAGES_NUMBER) return false;
+
+    uint8_t dir;
     msg_ptr += 1;
 
-    switch (message_type) {
+    switch ((GuiMessage) message_type) {
         case PlaceBomb:
-            cout << "PlaceBomb\n";
+            if (debug) std::cerr << "received PlaceBomb message from gui\n";
+            break;
         case PlaceBlock:
-            cout << "PlaceBlock\n";
+            if (debug) std::cerr << "received PlaceBlock message from gui\n";
             if (len != 1) return false;
             break;
         case Move:
-            cout << "Move\n";
+            if (debug) std::cerr << "received Move message from gui\n";
             if (len != 2) return false;
-            dir = (Direction) *((uint8_t*) msg_ptr);
-            if (dir != Up && dir != Down && dir != Right && dir != Left) return false;
+            dir = *((uint8_t*) msg_ptr);
+            if (dir >= DIRECTIONS_NUMBER) return false;
             break;
         default:
             return false;
@@ -372,93 +114,163 @@ bool check_gui_message_correctness(char *gui_message, size_t len) {
     return true;
 }
 
-bool parse_hello_message(char *message, size_t len, GameParameters &g) {
-    char *msg_ptr = message;
-    auto message_type = (ServerMessage) *((uint8_t*) msg_ptr);
-    if (message_type != Hello) return false;
+// This function parses (probably) hello message and sets GameParameters accordingly.
+void parse_hello_message(Buffer &msg_buffer, GameParameters &g) {
+    uint8_t message_type = msg_buffer.get_u8();
+    if ((ServerMessage) message_type != Hello) exit(EXIT_FAILURE);
 
-    msg_ptr += sizeof(uint8_t);
-    uint8_t server_name_len = *((uint8_t*) msg_ptr);
-    if (len != server_name_len + 13) return false;
+    if (debug) std::cerr << "received Hello message from server\n";
 
-    msg_ptr += sizeof(uint8_t);
-    char server_name[server_name_len];
-    memcpy(server_name, msg_ptr, server_name_len);
-    msg_ptr += server_name_len;
+    uint8_t server_name_len = msg_buffer.get_u8();
+    std::string server_name = msg_buffer.get_string(server_name_len);
 
-    uint8_t player_count = *((uint8_t*) msg_ptr);
-    msg_ptr += sizeof(uint8_t);
+    uint8_t player_count = msg_buffer.get_u8();
+    uint16_t size_x = msg_buffer.get_u16();
+    uint16_t size_y = msg_buffer.get_u16();
 
-    uint16_t size_x = *((uint16_t*) msg_ptr);
-    msg_ptr += sizeof(uint16_t);
+    uint16_t game_length = msg_buffer.get_u16();
+    uint16_t explosion_radius = msg_buffer.get_u16();
+    uint16_t bomb_timer = msg_buffer.get_u16();
 
-    uint16_t size_y = *((uint16_t*) msg_ptr);
-    msg_ptr += sizeof(uint16_t);
-
-    uint16_t game_length = *((uint16_t*) msg_ptr);
-    msg_ptr += sizeof(uint16_t);
-
-    uint16_t explosion_radius = *((uint16_t*) msg_ptr);
-    msg_ptr += sizeof(uint16_t);
-
-    uint16_t bomb_timer = *((uint16_t*) msg_ptr);
-    msg_ptr += sizeof(uint16_t);
-
-    g = GameParameters(std::string(server_name), player_count, size_x, size_y,
+    g = GameParameters(server_name, player_count, size_x, size_y,
                        game_length, explosion_radius, bomb_timer);
+}
+
+// This function reads player map from the server and creates new GameState.
+GameState handle_game_started(Buffer &msg_buffer) {
+    players_map_t players{};
+    uint32_t map_len = msg_buffer.get_u32();
+
+    for (size_t i = 0; i < map_len; i++)
+        players.insert(get_player_data(msg_buffer));
+
+    positions_set_t initial_blocks{};
+    player_positions_map_t initial_player_positions{};
+    return {players, initial_blocks, initial_player_positions};
+}
+
+// This function checks if players scores are calculated correctly.
+// Returns true if they are, false if they aren't.
+bool handle_game_ended(Buffer &msg_buffer, GameState &state) {
+    scores_map_t player_scores{};
+    uint32_t map_len = msg_buffer.get_u32();
+
+    for (size_t i = 0; i < map_len; i++)
+        player_scores.insert(get_player_score(msg_buffer));
+
+    for (auto score: state.scores)
+        if (score.second != player_scores[score.first]) return false;
+
     return true;
 }
 
-ServerMessage parse_server_message(char *message, size_t len, GameState &g) {
-    char *msg_ptr = message;
-    uint8_t message_type = *((uint8_t*) msg_ptr);
+// This function parses a message received in Lobby state.
+// Exits if the first byte doesn't represent a valid message type.
+ServerMessage parse_lobby_msg(Buffer &msg_buffer, GameState &g,
+                              players_map_t &lobby_players, GameParameters &params) {
 
+    uint8_t message_type = msg_buffer.get_u8();
+    if (message_type > SERVER_MESSAGES_NUMBER) exit(EXIT_FAILURE);
+
+    positions_set_t initial_blocks{};
+    player_positions_map_t initial_player_positions{};
     switch((ServerMessage) message_type) {
-        case Hello:
-            cout << "Hello\n";
-            break;
-        case AcceptedPlayer:
-            cout << "AcceptedPlayer\n";
-            break;
-        case GameStarted:
-            cout << "GameStarted\n";
-            g = GameState({});
+        case AcceptedPlayer: // adding player
+            if (debug) std::cerr << "received AcceptedPlayer message from server\n";
+            lobby_players.insert(get_player_data(msg_buffer));
+            return AcceptedPlayer;
+        case GameStarted: // starting game
+            if (debug) std::cerr << "received GameStarted message from server\n";
+            g = handle_game_started(msg_buffer);
             return GameStarted;
-        case Turn:
-            cout << "Turn\n";
-            //aggregate_game_state(g);
-            break;
-        case GameEnded:
-            cout << "GameEnded\n";
-            break;
+        case Turn: // starting game
+            if (debug) std::cerr << "received Turn message from server\n";
+            g = GameState(lobby_players, initial_blocks, initial_player_positions);
+            aggregate_game_state(msg_buffer, g, params);
+            return Turn;
+        default: // ignoring other message types
+            return Unexpected;
     }
-    return Hello;
 }
 
-void handle_game_info_from_server(udp::socket &gui_socket, tcp::socket &server_socket) {
-    bool waiting_for_hello = false;
-    char server_message[UDP_BUFFER_LENGTH];
+// This function parses a message received in Game state.
+// Exits if the first byte doesn't represent a valid message type.
+ServerMessage parse_in_game_msg(Buffer &msg_buffer, GameState &g, GameParameters &params) {
 
-    GameParameters parameters;
-    GameState game_state;
-    players_map_t lobby_players{};
+    uint8_t message_type = msg_buffer.get_u8();
+    if (message_type > SERVER_MESSAGES_NUMBER) exit(EXIT_FAILURE);
+
+    switch((ServerMessage) message_type) {
+        case Turn: // aggregating game state
+            if (debug) std::cerr << "received Turn message from server\n";
+            g.explosions = {};
+            aggregate_game_state(msg_buffer, g, params);
+            return Turn;
+        case GameEnded: // ending game
+            if (debug) std::cerr << "received GameEnded message from server\n";
+            if (!handle_game_ended(msg_buffer, g))
+                std::cerr << "INCORRECT SCORES CALCULATION\n";
+            return GameEnded;
+        default: // we ignore other message types
+            return Unexpected;
+    }
+}
+
+// This function handles a message stored in a buffer received from the server.
+// Acts accordingly to received message.
+void handle_server_message(GameData &status, Buffer &msg_buffer,
+                           ConnectionsData &connections) {
+
+    char buffer_for_gui[UDP_BUFFER_LENGTH];
+    if (status.waiting_for_hello) {
+        parse_hello_message(msg_buffer, status.parameters);
+        status.waiting_for_hello = false;
+        send_lobby_to_gui(status, connections, buffer_for_gui);
+    }
+    else {
+        if (get_state() == Lobby || get_state() == SendJoin) {
+            ServerMessage msg = parse_lobby_msg(msg_buffer, status.game_state,
+                                                status.lobby_players,status.parameters);
+
+            if (msg == GameStarted || msg == Turn) set_state(Game);
+            else if (msg == AcceptedPlayer) {
+                send_lobby_to_gui(status, connections, buffer_for_gui);
+            }
+        }
+        else {
+            ServerMessage msg = parse_in_game_msg(msg_buffer, status.game_state,
+                                                  status.parameters);
+
+            if (msg == Turn) {
+                send_game_to_gui(status, connections, buffer_for_gui);
+            }
+            else if (msg == GameEnded) {
+                status.lobby_players = {};
+                send_lobby_to_gui(status, connections, buffer_for_gui);
+                set_state(SendJoin);
+            }
+        }
+    }
+}
+
+// Function executed by a thread.
+// It receives messages from the server in an endless loop and
+// sends lobby and game state to gui.
+void handle_game_info_from_server(ConnectionsData &connections) {
+    GameData status;
 
     try {
         while (true) {
-            size_t message_length = server_socket.receive(
-                    boost::asio::buffer(server_message));
+            Buffer buffer(connections.server_socket);
+            size_t message_size = buffer.receive_new_data();
 
-            if (waiting_for_hello) {
-                if (parse_hello_message(server_message, message_length, parameters)) {
-                    waiting_for_hello = false;
-                }
+            if (debug) {
+                std::cerr << "received " << message_size <<
+                " bytes from " << connections.server_endpoint << "\n";
             }
-            else {
-                ServerMessage m = parse_server_message(server_message, message_length, game_state);
 
-                /*switch (parse_server_message(server_message, message_length, game_state)) {
-
-                }*/
+            while(buffer.get_msg_len() != buffer.get_parsed_len()) {
+                handle_server_message(status, buffer, connections);
             }
         }
     }
@@ -467,33 +279,40 @@ void handle_game_info_from_server(udp::socket &gui_socket, tcp::socket &server_s
     }
 }
 
-void handle_user_input_from_gui(udp::socket &gui_socket, tcp::socket &server_socket,
-                                std::string &player_name) {
-
-    bool first_message = true;
-    bool send_join = false;
+// Function executed by another thread.
+// It receives messages from gui in an endless loop and sends
+// user input to the server.
+void handle_user_input_from_gui(ConnectionsData &connections) {
     char gui_message[UDP_BUFFER_LENGTH];
 
     try {
         while (true) {
-            udp::endpoint sender_endpoint;
-            size_t message_length = gui_socket.receive_from(
-                    boost::asio::buffer(gui_message, UDP_BUFFER_LENGTH), sender_endpoint);
+            boost::asio::ip::udp::endpoint sender_endpoint;
+            size_t message_size = connections.gui_socket.receive_from(
+                boost::asio::buffer(gui_message, UDP_BUFFER_LENGTH),
+                                           sender_endpoint);
 
-            if (check_gui_message_correctness(gui_message, message_length)) {
-                if (first_message) {
-                    curr_situation_mutex.lock();
-                    if (current_situation == Lobby) send_join = true;
-                    curr_situation_mutex.unlock();
-
-                    if (send_join) send_join_request(player_name, server_socket);
-                    first_message = false;
-                }
-
+            if (debug) {
+                std::cerr << "received " << message_size <<
+                " bytes from " << connections.gui_endpoint << "\n";
             }
-            //jeśli pierwsza wyślij join
-            //wpp prześlij do serwera :)
 
+            if (check_gui_message_correctness(gui_message, message_size)) {
+                if (get_state() == SendJoin) {
+                    send_join_request(connections);
+                    set_state(Lobby);
+                }
+                else {
+                    gui_message[0] = char ((int) gui_message[0] + 1);
+                    connections.server_socket.send(
+                        boost::asio::buffer(gui_message, message_size));
+
+                    if (debug) {
+                        std::cerr << "sent " << message_size <<
+                        " bytes to " << connections.server_endpoint << "\n";
+                    }
+                }
+            }
         }
     }
     catch (std::exception& e) {
@@ -501,37 +320,21 @@ void handle_user_input_from_gui(udp::socket &gui_socket, tcp::socket &server_soc
     }
 }
 
+// The main function. Connects client to gui and server.
+// Launches two threads executing above functions.
 int main(int argc, char* argv[]) {
+    ClientOptions options;
+    if (!check_client_options(options, argc, argv)) exit(EXIT_FAILURE);
 
-    Options options;
-    if (!check_program_options(options, argc, argv)) exit(EXIT_FAILURE);
-
-    try
-    {
-        string gui_address, gui_port, server_address, server_port;
-        get_hostname_and_port(options.gui_address, gui_address, gui_port);
-        get_hostname_and_port(options.server_address, server_address, server_port);
-
-        boost::asio::io_context io_context;
-        tcp::resolver server_r(io_context);
-        tcp::socket server_socket(io_context);
-
-        tcp::resolver::results_type server_endpoints = server_r.resolve(server_address, server_port);
-        boost::asio::connect(server_socket, server_endpoints);
-
-        udp::socket gui_socket(io_context, udp::endpoint(udp::v6(), options.port));
-
-        udp::resolver gui_r(io_context);
-        udp::resolver::results_type endpoints = gui_r.resolve(gui_address, gui_port);
+    try {
+        ConnectionsData connections_data(options);
 
         std::string player_name = options.player_name;
-        std::thread gui_receiver_thread([&gui_socket, &server_socket, &player_name]() {
-            handle_user_input_from_gui(gui_socket, server_socket, player_name);
-        });
+        std::thread gui_receiver_thread(handle_user_input_from_gui,
+                                        std::ref(connections_data));
 
-        std::thread server_receiver_thread([&gui_socket, &server_socket]() {
-            handle_game_info_from_server(gui_socket, server_socket);
-        });
+        std::thread server_receiver_thread(handle_game_info_from_server,
+                                           std::ref(connections_data));
 
         gui_receiver_thread.join();
         server_receiver_thread.join();
